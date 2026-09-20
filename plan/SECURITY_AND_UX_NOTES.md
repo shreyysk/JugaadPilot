@@ -1,0 +1,36 @@
+# JugaadPilot — Security & UX Review
+
+Covers everything built so far (Phase 1 + Phase 2). This isn't a generic checklist — it's specific to what this app actually does: it moves recommendations (and eventually real sell decisions) based on someone's real money, over a public Telegram webhook, for multiple people sharing one Supabase project.
+
+## Security
+
+### Fixed in this pass
+- **Telegram webhook had no signature check.** Anyone who found the webhook URL could POST a fake "Yes, invested" or a fake sell-confirmation callback. `telegram_webhook_security.ts` adds `verifySecretToken()` (constant-time compare against the `secret_token` Telegram sends back) — **reject with 401 before parsing the body** if this fails. Set the secret when you call `setWebhook`.
+- **No replay/idempotency protection.** Telegram redelivers on retry, and a double-tap before the button visibly disables can send the same callback twice — either would double-apply a rollover or double-log a confirmation. Added `processed_telegram_updates` (schema) + `isDuplicateUpdate()` (code): check `update_id` against it before acting, insert after.
+- **Ad-hoc callback_data parsing.** Each webhook handler would otherwise hand-roll `split(":")` on untrusted input. `parseCheckinCallback()` validates shape (UUID, date format) before anything downstream trusts `planId` as a real UUID to query with.
+
+### Already reasonably solid, worth confirming as you implement
+- **RLS on every per-user table** (`auth.uid() = user_id`) — this is your main line of defense given the multi-user + invite-only design. Double check the shared tables (`price_cache`, `price_history`) deliberately have **no** RLS (correct, since they're not per-user) but also confirm your Supabase anon/authenticated roles can't `INSERT`/`UPDATE` them — only your scheduled job's service-role key should write there.
+- **Admin cross-user view** — deliberately *not* a client-side RLS policy (`is_admin` bypass policies are a classic mistake: a compromised or reused JWT then reads everyone's holdings). Keep it behind a server-side function using the service role, with its own audit log of who viewed what and when — you don't have that log yet, worth adding once you build the admin dashboard.
+- **`ai_api_key_ciphertext`** — stored, correctly, as ciphertext not plaintext. Confirm the encryption key itself lives outside the database (env var / secrets manager on your job runner), not in a `settings` row — otherwise a DB dump defeats the "ciphertext" entirely. Supabase Vault is the natural fit if you're on Supabase.
+- **CAS/CAMS import staging** — good instinct to land parsed statement rows in a review table rather than writing straight to `investments`. Keep it that way even once the parser exists; auto-applying parsed financial data without a human glance is where import bugs turn into wrong portfolio numbers silently.
+
+### Open risks worth deciding on deliberately (not fixed yet — need your call)
+- **The safer-sell engine never executes a trade itself** (`buildSaferSellPlan` is pure — it only ranks and suggests). Keep it that way. When you build the "confirm and sell" step, make it a **separate, explicit action** the user taps after seeing the full breakdown (units, net proceeds after tax, drift impact) — never a single tap that both "asks" and "executes." A misread MCQ-style button is a much bigger deal here than in the monthly check-in.
+- **Non-equity STCG tax rate defaults to 30% (highest slab)** in `capital_gains_calculator.ts` when the user hasn't told the app their slab. That's a conservative *estimate* default, but if it ever flows into a real decision ("sell this, you'll net ₹X after tax"), a wrong slab assumption changes the number meaningfully. Consider forcing the user to set their slab once in settings rather than silently defaulting.
+- **Rate limits on the webhook endpoint itself** (not just idempotency) — a flood of POSTs to the webhook URL is still possible even with signature verification (it just means most get rejected, but you're still doing the compare + DB round-trip per request). If this ever gets non-trivial traffic, add a basic rate limit in front (Supabase Edge Functions / Netlify can front this with a simple per-IP or per-token limiter).
+- **Backups / point-in-time recovery** on the Supabase project — not something this document's code can fix, but for an app that's the system of record for someone's actual portfolio, confirm PITR or scheduled backups are actually turned on, not assumed.
+
+## UI/UX
+
+These are more important here than in a typical app because the cost of a misunderstood screen is a real financial mistake, not a broken layout.
+
+- **Never let a recommendation look like a completed action.** "Sell ₹8,240 of gold" should visually read as a *suggestion card* (drift %, tax type, net proceeds, rationale) with its own explicit "Confirm sell" button — not phrasing that could be misread as "this already happened." This matters most for: the safer-sell plan, the rebalancing "buy/sell" recommendations, and the escalation override (make it visually obvious whether the user is looking at "your ongoing default" vs "a one-time override for next year only" — those are easy to confuse in a compact settings UI).
+- **Money formatting stays consistent everywhere** — you're already using `toLocaleString("en-IN", { style: "currency", currency: "INR" })` in the planner and alert engine; carry that through goals, loans, and the expense manager rather than plain numbers, especially since ₹ lakh/crore grouping (`en-IN`) reads very differently from the `en-US` grouping most chart libraries default to.
+- **Don't rely on color alone** for drift/over-under-allocation or gain/loss — pair red/green with a +/- sign and the word "over"/"under" or "gain"/"loss", since this is meant to be usable by invited family/friends, not just you, and color-only signals fail for colorblind users and in bright sunlight on a phone (likely how most of this gets checked, via Telegram).
+- **Urgent-expense flow should minimize taps under stress** — if someone's flagging an expense as urgent because they need cash now, the safer-sell suggestions should appear with as few screens as possible (amount → ranked options → confirm), not buried behind a general "expenses" tab with a separate "get sell suggestions" button.
+- **Escalation history should be visible, not just logged** — since the % can now vary year to year, show a simple timeline ("2025: +10%, 2026: skipped, 2027: +12%") on the plan screen so nobody has to guess why this year's amount doesn't match a mental "10% forever" assumption.
+- **Confirmation-fatigue tradeoff**: the monthly Yes/No check-in should stay a single tap (low stakes, easily reversible via rollover), but a sell confirmation should be a genuine second step (tap suggestion → see full breakdown → separate confirm) — don't apply the same "one tap and done" pattern to both just for consistency; the stakes are different.
+
+## What this doesn't cover yet
+Auth/session handling (Supabase Auth config, session length, invite-link expiry) and the actual admin dashboard and CAS parser haven't been built yet, so there's nothing to review there — flag them for a security pass when they're built, not after.
